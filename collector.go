@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,6 +34,7 @@ type spaceliftCollector struct {
 	currentBillingPeriodUsedPublicSeconds  *prometheus.Desc
 	currentBillingPeriodUsedSeats          *prometheus.Desc
 	currentBillingPeriodUsedPrivateWorkers *prometheus.Desc
+	stackState                             *prometheus.Desc
 	scrapeDuration                         *prometheus.Desc
 	buildInfo                              *prometheus.Desc
 }
@@ -113,6 +115,11 @@ func newSpaceliftCollector(ctx context.Context, httpClient *http.Client, session
 			"The number of private workers used in the current billing period",
 			nil,
 			nil),
+		stackState: prometheus.NewDesc(
+			"stack_state",
+			"The number of stacks in a current state for a given team",
+			[]string{"team", "state"},
+			nil),
 		scrapeDuration: prometheus.NewDesc(
 			"spacelift_scrape_duration_seconds",
 			"The duration in seconds of the request to the Spacelift API for metrics",
@@ -139,10 +146,18 @@ func (c *spaceliftCollector) Describe(descriptorChannel chan<- *prometheus.Desc)
 	descriptorChannel <- c.currentBillingPeriodUsedPublicSeconds
 	descriptorChannel <- c.currentBillingPeriodUsedSeats
 	descriptorChannel <- c.currentBillingPeriodUsedPrivateWorkers
+	descriptorChannel <- c.stackState
 	descriptorChannel <- c.buildInfo
 }
 
 type metricsQuery struct {
+	Stacks []struct {
+		State  string   `graphql:"state"`
+		Labels []string `graphql:"labels"`
+		Delta  struct {
+			Resources int `graphql:"resources"`
+		} `graphql:"delta"`
+	} `graphql:"stacks"`
 	PublicWorkerPool struct {
 		Parallelism int `graphql:"parallelism"`
 		BusyWorkers int `graphql:"busyWorkers"`
@@ -223,4 +238,25 @@ func (c *spaceliftCollector) Collect(metricChannel chan<- prometheus.Metric) {
 		}
 		metricChannel <- prometheus.MustNewConstMetric(c.workerPoolWorkersDrained, prometheus.GaugeValue, float64(drained), workerPool.ID, workerPool.Name)
 	}
+
+	// TODO: index these values off the SpaceID once its ready for general consumption
+	teamStates := map[string]map[string]int{}
+	for _, stack := range query.Stacks {
+		for _, l := range stack.Labels {
+			s := strings.Split(l, "/")
+			if s[0] == "team" {
+				if _, ok := teamStates[s[1]]; !ok {
+					teamStates[s[1]] = map[string]int{}
+				}
+				teamStates[s[1]][stack.State] += 1
+			}
+		}
+	}
+
+	for teamName, team := range teamStates {
+		for state, count := range team {
+			metricChannel <- prometheus.MustNewConstMetric(c.stackState, prometheus.GaugeValue, float64(count), teamName, state)
+		}
+	}
+
 }
